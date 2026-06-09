@@ -1,34 +1,50 @@
-#!/bin/bash
-# SLURM job array for the PINN sweep.
-# Main sweep: SWEEP="main"  → 42 configs × 5 seeds = 210 jobs → array 0-209
-# Follow-up:  SWEEP="followup" → N configs × 5 seeds, adjust --array accordingly
+#!/bin/sh
+# LSF job array for the PINN sweep — DTU HPC
+#
+# Submit:       bsub < submit.sh
+# Check status: bstat
+#
+# Main sweep: SWEEP="main" in configs.py → 42 configs × 5 seeds = 210 jobs
+# Follow-up:  SWEEP="followup"           → adjust [0-N] below accordingly
 
-#SBATCH --job-name=pinn_sweep
-#SBATCH --array=0-209
-#SBATCH --time=06:00:00
-#SBATCH --mem=8G
-#SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:1               # remove this line if running CPU-only
-#SBATCH --output=logs/%A_%a.out
-#SBATCH --error=logs/%A_%a.err
+### Job name and array indices
+#BSUB -J "pinn_sweep[0-209]"
 
-# ---- Cluster-specific setup (adjust for your HPC) -------------------------
-module load python/3.11            # or whichever Python module your cluster has
-source "$HOME/venv/bin/activate"   # path to your virtual environment
+### Queue
+#BSUB -q hpc
+
+### Cores (single node)
+#BSUB -n 4
+#BSUB -R "span[hosts=1]"
+
+### Memory: 4 GB per core → 16 GB total
+#BSUB -R "rusage[mem=4GB]"
+#BSUB -M 4GB
+
+### Walltime (hh:mm) — 8 hours should be safe for 10k epochs
+#BSUB -W 08:00
+
+### Output and error files (%J = job id, %I = array index)
+#BSUB -o logs/pinn_%J_%I.out
+#BSUB -e logs/pinn_%J_%I.err
+
+### Email when job finishes
+#BSUB -N
+
 # ---------------------------------------------------------------------------
+# Environment — you already have a "pytorch" conda environment
+# ---------------------------------------------------------------------------
+source activate pytorch
 
 mkdir -p logs results
 
 python train.py \
-    --job_id  "$SLURM_ARRAY_TASK_ID" \
-    --n_seeds 8 \
+    --job_id  "$LSB_JOBINDEX" \
+    --n_seeds 5 \
     --out_dir results
 
 # ---------------------------------------------------------------------------
-# To run the finite-difference reference solvers (fast, submit separately):
-#   sbatch --wrap="python train.py --fd_config_idx 0 --out_dir results"
-#   sbatch --wrap="python train.py --fd_config_idx 1 --out_dir results"
-# Or just run them interactively (each takes < 1 second):
+# Finite-difference reference (fast — run interactively, not via job array):
 #   python train.py --fd_config_idx 0
 #   python train.py --fd_config_idx 1
 # ---------------------------------------------------------------------------
