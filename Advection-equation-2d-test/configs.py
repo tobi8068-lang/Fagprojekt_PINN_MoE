@@ -29,9 +29,6 @@ import torch
 # ===========================================================================
 
 # --- Domain extents & PDE coefficients ------------------------------------
-# IC: Gaussian centred at x=1, y=0 with σ=√2.
-# x: IC centre x=1, advected to x=1+v*T=4 at T=3 — allow margin on both ends.
-# y: Neumann BCs at y=0 and y=Y_hi; Gaussian (centred at y=0) has σ_y≈2.8 at T=3.
 _X_LO, _X_HI = -1.0,  8.0  # x training region
 _Y_LO, _Y_HI = -7.0,  7.0  # y training region — Cauchy problem, symmetric about y=0
 _T  = 1.0    # time horizon [0, T]
@@ -171,13 +168,13 @@ _TRAIN_BASE = {
     "adam_gamma":        0.5,
     "base_weights":      {"pde": 10.0, "ini": 10.0, "load": 1e-2},
     "softadapt_beta":    5.0,
-    "refine_every":      400,
+    "refine_every":      100,
     "n_candidates":      8000,
     "replace_fraction":  0.2,
     "refine_gamma":      50.0,
     "lbfgs_max_iter":    600,
-    "eval_every":        500,
-    "log_every":         500,
+    "eval_every":        200,
+    "log_every":         200,
 }
 
 # ---------------------------------------------------------------------------

@@ -444,6 +444,13 @@ def train(model, all_params, domain_params, config, eval_fn=None):
     eval_every   = config.get("eval_every", 0)
     adam_epochs  = config.get("adam_epochs", 10000)
     refine_every = config.get("refine_every", 400)
+
+    # Record error at epoch 0 (before any training) so wall-clock curves start at t=0
+    if eval_fn is not None and eval_every > 0:
+        metrics = eval_fn(model, 0)
+        hist["eval_epochs"].append(0)
+        hist["eval_l2_rel"].append(metrics.get("l2_rel", float("nan")))
+        hist["eval_max_err"].append(metrics.get("max_err", float("nan")))
     log_every    = config.get("log_every", 500)
     use_fd       = config.get("use_fd_deriv", True)
 

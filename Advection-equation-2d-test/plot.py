@@ -196,7 +196,8 @@ def fig_convergence(pinn_df, ranked, top=5, save_dir="figures"):
             if len(ep) == 0:
                 continue
             li = d["eval_max_err"].astype(float) if "eval_max_err" in d else np.full_like(l2, np.nan)
-            wt_at_eval = wt[ep.astype(int) - 1]
+            # epoch 0 is before training → wall time = 0; epochs ≥1 index into wt
+            wt_at_eval = np.array([0.0 if e == 0 else wt[int(e) - 1] for e in ep])
             all_ep.append(ep); all_l2.append(l2); all_li.append(li); all_wt.append(wt_at_eval)
 
         if not all_l2:
