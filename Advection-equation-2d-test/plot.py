@@ -247,6 +247,111 @@ def fig_convergence(pinn_df, ranked, top=5, save_dir="figures"):
 
 
 # ---------------------------------------------------------------------------
+# Figure 6 — Curated convergence: top-3, best vanilla, best MoE, median
+# ---------------------------------------------------------------------------
+
+def fig_convergence_curated(pinn_df, ranked, save_dir="figures"):
+    names_ordered = ranked["name"].tolist()   # rank-ordered (best first)
+
+    van_ranked = ranked[ranked["use_moe"] == False]
+    moe_ranked = ranked[ranked["use_moe"] == True]
+    best_van   = van_ranked.iloc[0]["name"];  van_rank = int(van_ranked.index[0])
+    best_moe   = moe_ranked.iloc[0]["name"];  moe_rank = int(moe_ranked.index[0])
+    med_row    = ranked.iloc[len(ranked) // 2]
+    med_name   = med_row["name"];             med_rank = int(med_row.name)
+
+    # Build ordered dict: name → short label (rank + roles)
+    selected = {}
+    for r in ranked.head(3).itertuples():
+        selected[r.name] = f"#{r.Index}"
+
+    # Annotate or add best vanilla
+    if best_van in selected:
+        selected[best_van] += " best-van"
+    else:
+        selected[best_van] = f"#{van_rank} best-van"
+
+    # Annotate or add best MoE
+    if best_moe in selected:
+        selected[best_moe] += " best-MoE"
+    else:
+        selected[best_moe] = f"#{moe_rank} best-MoE"
+
+    # Annotate or add median
+    if med_name in selected:
+        selected[med_name] += " median"
+    else:
+        selected[med_name] = f"#{med_rank} median"
+
+    # Sort by rank
+    ordered = sorted(selected.keys(), key=lambda n: names_ordered.index(n))
+    colors  = plt.cm.tab10(np.linspace(0, 0.9, len(ordered)))
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+    (ax_l2_ep, ax_l2_t), (ax_li_ep, ax_li_t) = axes
+
+    min_max_wt = np.inf
+
+    for color, name in zip(colors, ordered):
+        use_moe = ranked[ranked["name"] == name]["use_moe"].iloc[0]
+        ls      = "--" if use_moe else "-"
+        subset  = pinn_df[pinn_df["name"] == name]
+        all_l2, all_li, all_ep, all_wt = [], [], [], []
+
+        for _, row in subset.iterrows():
+            d  = np.load(row["_path"], allow_pickle=True)
+            ep = d["eval_epochs"].astype(float)
+            l2 = d["eval_l2_rel"].astype(float)
+            wt = d["hist_wall_time"].astype(float)
+            if len(ep) == 0:
+                continue
+            li = d["eval_max_err"].astype(float) if "eval_max_err" in d else np.full_like(l2, np.nan)
+            wt_at_eval = np.array([0.0 if e == 0 else wt[int(e) - 1] for e in ep])
+            all_ep.append(ep); all_l2.append(l2); all_li.append(li); all_wt.append(wt_at_eval)
+
+        if not all_l2:
+            continue
+
+        n      = min(len(x) for x in all_l2)
+        ep_ref = all_ep[0][:n]
+        wt_ref = np.mean([x[:n] for x in all_wt], axis=0)
+        lbl    = selected[name]
+        min_max_wt = min(min_max_wt, wt_ref[-1])
+
+        for (ax_ep, ax_t), all_vals in [
+            ((ax_l2_ep, ax_l2_t), all_l2),
+            ((ax_li_ep, ax_li_t), all_li),
+        ]:
+            mat  = np.array([x[:n] for x in all_vals])
+            mean = mat.mean(axis=0)
+            std  = mat.std(axis=0)
+            for ax, xs in [(ax_ep, ep_ref), (ax_t, wt_ref)]:
+                ax.semilogy(xs, mean, color=color, ls=ls,
+                            label=lbl if ax is ax_l2_ep else None, lw=1.8)
+                ax.fill_between(xs,
+                                np.maximum(mean - std, 1e-12),
+                                mean + std, color=color, alpha=0.12)
+
+    if np.isfinite(min_max_wt):
+        ax_l2_t.set_xlim(left=0, right=min_max_wt)
+        ax_li_t.set_xlim(left=0, right=min_max_wt)
+
+    for ax, xlabel, ylabel, title in [
+        (ax_l2_ep, "Epoch",          "L2 relative error",  "Curated — L2 vs epoch"),
+        (ax_l2_t,  "Wall-clock (s)", "L2 relative error",  "Curated — L2 vs time"),
+        (ax_li_ep, "Epoch",          "L∞ absolute error",  "Curated — L∞ vs epoch"),
+        (ax_li_t,  "Wall-clock (s)", "L∞ absolute error",  "Curated — L∞ vs time"),
+    ]:
+        ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+        ax.set_title(title);   ax.grid(True, which="both", ls=":", alpha=0.4)
+
+    ax_l2_ep.legend(fontsize=8, loc="upper right",
+                    title="solid=vanilla  dashed=MoE", title_fontsize=7)
+    fig.tight_layout()
+    _save(fig, save_dir, "6_convergence_curated.png")
+
+
+# ---------------------------------------------------------------------------
 # Figure 3 — Method toggle effect (boxplots)
 # ---------------------------------------------------------------------------
 
@@ -480,6 +585,7 @@ def main():
     print("Generating figures...")
     fig_ranking(ranked,    fd_df,  top=args.top,  save_dir=args.figures)
     fig_convergence(pinn_df, ranked, top=5,         save_dir=args.figures)
+    fig_convergence_curated(pinn_df, ranked,         save_dir=args.figures)
     fig_toggles(pinn_df,                            save_dir=args.figures)
     fig_time_vs_error(pinn_df, fd_df,               save_dir=args.figures)
     fig_heatmaps(pinn_df, ranked,                   save_dir=args.figures)
