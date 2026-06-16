@@ -6,7 +6,7 @@ a consistent property of the config or just an unlucky seed draw.
 
 Usage:
     python plot_50seeds.py
-    python plot_50seeds.py --seeds50 results_50seeds --main results_run1
+    python plot_50seeds.py --seeds50 results_50seeds --main results
 """
 import argparse
 
@@ -27,9 +27,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds50", default="results_50seeds",
                          help="Directory with the 50-seed re-runs")
-    parser.add_argument("--main", default="results_run1",
-                         help="Directory with the original 5-seed sweep "
-                              "(use 'results' if you haven't archived it yet)")
+    parser.add_argument("--main", default="results",
+                         help="Directory with the original 5-seed sweep")
     parser.add_argument("--figures", default="figures_50seeds")
     args = parser.parse_args()
 
