@@ -16,6 +16,7 @@ Figures produced:
 import argparse
 import glob
 import os
+import re
 import sys
 
 import numpy as np
@@ -37,6 +38,28 @@ def _s(d, key, default=""):
         return default
     v = d[key]
     return v.item() if hasattr(v, "item") else v
+
+
+_MOD_LABELS = [
+    ("rff", "Fourier Features"),
+    ("fd",  "Finite Diff."),
+    ("sa",  "SoftAdapt"),
+    ("ar",  "Adaptive Refine"),
+    ("lb",  "L-BFGS"),
+]
+_NAME_RE = re.compile(r"^(vanilla|moe_\w+?)_rff(\d)_fd(\d)_sa(\d)_ar(\d)_lb(\d)$")
+
+
+def pretty_name(name):
+    """e.g. 'moe_cont_rff1_fd0_sa1_ar0_lb0' -> 'MoE with Fourier Features, SoftAdapt'."""
+    m = _NAME_RE.match(name)
+    if not m:
+        return name
+    model_tag, rff, fd, sa, ar, lb = m.groups()
+    model = "MoE" if model_tag.startswith("moe") else "Vanilla"
+    flags = dict(zip(["rff", "fd", "sa", "ar", "lb"], [rff, fd, sa, ar, lb]))
+    mods  = [label for key, label in _MOD_LABELS if flags[key] == "1"]
+    return f"{model} (baseline)" if not mods else f"{model} with " + ", ".join(mods)
 
 
 def load_results(results_dir="results"):
@@ -147,14 +170,15 @@ def print_ranking(ranked, fd_df, top=20):
 def fig_ranking(ranked, fd_df, top=15, save_dir="figures"):
     top_df = ranked.head(top).iloc[::-1]   # reverse so best is at top
 
-    fig, ax = plt.subplots(figsize=(9, max(4, top * 0.42)))
+    fig, ax = plt.subplots(figsize=(11, max(4, top * 0.42)))
 
     colors = plt.cm.RdYlGn(np.linspace(0.85, 0.15, len(top_df)))
     bars = ax.barh(
-        top_df["name"], top_df["median_l2"],
+        top_df["name"].map(pretty_name), top_df["median_l2"],
         xerr=top_df["std_l2"].fillna(0),
         color=colors, edgecolor="white", height=0.65, capsize=3,
     )
+    ax.tick_params(axis="y", labelsize=8)
     for bar, val in zip(bars, top_df["median_l2"]):
         ax.text(bar.get_width() * 1.04, bar.get_y() + bar.get_height() / 2,
                 f"{val:.2e}", va="center", fontsize=8)
@@ -207,7 +231,7 @@ def fig_convergence(pinn_df, ranked, top=5, save_dir="figures"):
         n      = min(len(x) for x in all_l2)
         ep_ref = all_ep[0][:n]
         wt_ref = np.mean([x[:n] for x in all_wt], axis=0)
-        lbl    = name[:32]
+        lbl    = pretty_name(name)
 
         min_max_wt = min(min_max_wt, wt_ref[-1])
 
@@ -241,7 +265,7 @@ def fig_convergence(pinn_df, ranked, top=5, save_dir="figures"):
         ax.set_title(title)
         ax.grid(True, which="both", ls=":", alpha=0.4)
 
-    ax_l2_ep.legend(fontsize=7, loc="upper right")
+    ax_l2_ep.legend(fontsize=6, loc="upper right")
 
     fig.tight_layout()
     _save(fig, save_dir, "2_convergence.png")
@@ -261,28 +285,28 @@ def fig_convergence_curated(pinn_df, ranked, save_dir="figures"):
     med_row    = ranked.iloc[len(ranked) // 2]
     med_name   = med_row["name"];             med_rank = int(med_row.name)
 
-    # Build ordered dict: name → short label (rank + roles)
+    # Build ordered dict: name → short label (rank + pretty name + roles)
     selected = {}
     for r in ranked.head(3).itertuples():
-        selected[r.name] = f"#{r.Index}"
+        selected[r.name] = f"#{r.Index} {pretty_name(r.name)}"
 
     # Annotate or add best vanilla
     if best_van in selected:
-        selected[best_van] += " best-van"
+        selected[best_van] += " (best vanilla)"
     else:
-        selected[best_van] = f"#{van_rank} best-van"
+        selected[best_van] = f"#{van_rank} {pretty_name(best_van)} (best vanilla)"
 
     # Annotate or add best MoE
     if best_moe in selected:
-        selected[best_moe] += " best-MoE"
+        selected[best_moe] += " (best MoE)"
     else:
-        selected[best_moe] = f"#{moe_rank} best-MoE"
+        selected[best_moe] = f"#{moe_rank} {pretty_name(best_moe)} (best MoE)"
 
     # Annotate or add median
     if med_name in selected:
-        selected[med_name] += " median"
+        selected[med_name] += " (median)"
     else:
-        selected[med_name] = f"#{med_rank} median"
+        selected[med_name] = f"#{med_rank} {pretty_name(med_name)} (median)"
 
     # Sort by rank
     ordered = sorted(selected.keys(), key=lambda n: names_ordered.index(n))
@@ -346,7 +370,7 @@ def fig_convergence_curated(pinn_df, ranked, save_dir="figures"):
         ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
         ax.set_title(title);   ax.grid(True, which="both", ls=":", alpha=0.4)
 
-    ax_l2_ep.legend(fontsize=8, loc="upper right",
+    ax_l2_ep.legend(fontsize=6, loc="upper right",
                     title="solid=vanilla  dashed=MoE", title_fontsize=7)
     fig.tight_layout()
     _save(fig, save_dir, "6_convergence_curated.png")
@@ -375,7 +399,7 @@ def fig_toggles(pinn_df, save_dir="figures"):
     moe = pinn_df[pinn_df["use_moe"] == True]
 
     n_panels = 1 + len(toggles)   # MoE overview + one per method toggle
-    fig, axes = plt.subplots(1, n_panels, figsize=(18, 4.5), sharey=True)
+    fig, axes = plt.subplots(1, n_panels, figsize=(24,5), sharey=True)
 
     # --- Panel 0: Vanilla vs MoE (overview, 2 boxes) -------------------------
     ax = axes[0]
@@ -428,9 +452,9 @@ def fig_toggles(pinn_df, save_dir="figures"):
         Patch(facecolor=CM1, alpha=0.85, label="MoE · On"),
     ]
     fig.legend(handles=legend_handles, loc="upper center", ncol=4,
-               fontsize=9, bbox_to_anchor=(0.5, 1.08))
+               fontsize=13, bbox_to_anchor=(0.5, 1.08))
 
-    fig.suptitle("Effect of each method toggle — all configs, all seeds", y=1.14)
+    fig.suptitle("Effect of each method toggle — all configs, all seeds", y=1.14,fontsize=21)
     fig.tight_layout()
     _save(fig, save_dir, "3_toggles.png", bbox_inches="tight")
 
@@ -545,7 +569,7 @@ def fig_heatmaps(pinn_df, ranked, save_dir="figures"):
             ax.set_ylabel(f"t = {t_val:.2f}" if col_idx == 0 else "y")
             ax.set_xlabel("x")
 
-    fig.suptitle(f"Solution heatmaps — {best_name}", fontsize=12, y=1.01)
+    fig.suptitle(f"Solution heatmaps — {pretty_name(best_name)}", fontsize=12, y=1.01)
     _save(fig, save_dir, "5_heatmaps.png", bbox_inches="tight")
 
 
