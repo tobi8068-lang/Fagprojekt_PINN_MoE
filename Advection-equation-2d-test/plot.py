@@ -255,10 +255,10 @@ def fig_convergence(pinn_df, ranked, top=5, save_dir="figures"):
         ax_li_t.set_xlim(left=0, right=min_max_wt)
 
     for ax, xlabel, ylabel, title in [
-        (ax_l2_ep, "Epoch",          "L2 relative error",   f"Top {top} — L2 vs epoch"),
-        (ax_l2_t,  "Wall-clock (s)", "L2 relative error",   f"Top {top} — L2 vs time"),
-        (ax_li_ep, "Epoch",          "L∞ absolute error",   f"Top {top} — L∞ vs epoch"),
-        (ax_li_t,  "Wall-clock (s)", "L∞ absolute error",   f"Top {top} — L∞ vs time"),
+        (ax_l2_ep, "Epoch",          "L2 relative error",  f"Top {top} — L2 (relative) vs epoch"),
+        (ax_l2_t,  "Wall-clock (s)", "L2 relative error",  f"Top {top} — L2 (relative) vs time"),
+        (ax_li_ep, "Epoch",          "L2 norm (absolute)", f"Top {top} — L2 (total) vs epoch"),
+        (ax_li_t,  "Wall-clock (s)", "L2 norm (absolute)", f"Top {top} — L2 (total) vs time"),
     ]:
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
@@ -362,10 +362,10 @@ def fig_convergence_curated(pinn_df, ranked, save_dir="figures"):
         ax_li_t.set_xlim(left=0, right=min_max_wt)
 
     for ax, xlabel, ylabel, title in [
-        (ax_l2_ep, "Epoch",          "L2 relative error",  "Curated — L2 vs epoch"),
-        (ax_l2_t,  "Wall-clock (s)", "L2 relative error",  "Curated — L2 vs time"),
-        (ax_li_ep, "Epoch",          "L∞ absolute error",  "Curated — L∞ vs epoch"),
-        (ax_li_t,  "Wall-clock (s)", "L∞ absolute error",  "Curated — L∞ vs time"),
+        (ax_l2_ep, "Epoch",          "L2 relative error",  "Curated — L2 (relative) vs epoch"),
+        (ax_l2_t,  "Wall-clock (s)", "L2 relative error",  "Curated — L2 (relative) vs time"),
+        (ax_li_ep, "Epoch",          "L2 norm (absolute)", "Curated — L2 (total) vs epoch"),
+        (ax_li_t,  "Wall-clock (s)", "L2 norm (absolute)", "Curated — L2 (total) vs time"),
     ]:
         ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
         ax.set_title(title);   ax.grid(True, which="both", ls=":", alpha=0.4)

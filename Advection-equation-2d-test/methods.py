@@ -184,8 +184,32 @@ def pde_residual(model, x, y, t, domain_params, use_fd=True, h=1e-2, pde_fn=None
     return u, u_y, u_t, u_yy, u_x, u_xx, r, gates, expert_vals, ini_pred
 
 
+def _causal_pde_loss(r, t_batch, T, eps, n_bins):
+    """
+    Causal/temporal weighting of the PDE residual (Wang et al. 2022).
+
+    Bins collocation points by time and downweights later-time bins by
+    exp(-eps * cumulative residual of all earlier bins), so the loss only
+    rewards fitting later dynamics once earlier ones are already satisfied.
+    """
+    r2 = (r ** 2).reshape(-1)
+    t  = t_batch.reshape(-1)
+    bin_idx = torch.clamp((t / T * n_bins).long(), 0, n_bins - 1)
+
+    bin_means = torch.stack([
+        r2[bin_idx == b].mean() if (bin_idx == b).any()
+        else torch.zeros((), device=r.device, dtype=r.dtype)
+        for b in range(n_bins)
+    ])
+    with torch.no_grad():
+        cum_prior = torch.cumsum(bin_means, dim=0) - bin_means
+        weights   = torch.exp(-eps * cum_prior)
+    return torch.sum(weights * bin_means) / torch.sum(weights)
+
+
 def compute_losses(model, x_batch, y_batch, t_batch, domain_params, K,
-                   ic_fn=None, use_fd=True, pde_fn=None, bc_fn=None):
+                   ic_fn=None, use_fd=True, pde_fn=None, bc_fn=None,
+                   causal_eps=0.0, n_causal_bins=10):
     """
     Returns unweighted individual losses and gates.
 
@@ -193,6 +217,9 @@ def compute_losses(model, x_batch, y_batch, t_batch, domain_params, K,
     pde_fn : residual callable — from DOMAIN["pde_fn"].
     bc_fn  : optional boundary loss callable bc_fn(model, device, domain_params).
     K      : load-balancing scale (0 for vanilla).
+    causal_eps, n_causal_bins : optional causal weighting of the PDE loss
+                                (see _causal_pde_loss). causal_eps=0 (default)
+                                reproduces the plain mean-squared residual.
     """
     if ic_fn is None:
         ic_fn = lambda x, y: torch.sin(y)
@@ -201,7 +228,10 @@ def compute_losses(model, x_batch, y_batch, t_batch, domain_params, K,
         model, x_batch, y_batch, t_batch, domain_params, use_fd=use_fd, pde_fn=pde_fn,
     )
 
-    loss_pde  = torch.mean(r ** 2)
+    if causal_eps:
+        loss_pde = _causal_pde_loss(r, t_batch, domain_params["T"], causal_eps, n_causal_bins)
+    else:
+        loss_pde = torch.mean(r ** 2)
     loss_ini  = torch.mean((ic_fn(x_batch, y_batch) - ini_pred) ** 2)
     gbar      = torch.mean(gates, dim=0)
     loss_load = K * torch.sum(gbar ** 2)
@@ -363,6 +393,10 @@ def train(model, all_params, domain_params, config, eval_fn=None):
         # SoftAdapt params
         softadapt_beta      : float
 
+        # Causal weighting (optional, default off — see _causal_pde_loss)
+        causal_eps          : float
+        n_causal_bins       : int
+
         # Adam params
         adam_epochs         : int
         adam_lr             : float
@@ -374,6 +408,13 @@ def train(model, all_params, domain_params, config, eval_fn=None):
         n_candidates        : int
         replace_fraction    : float
         refine_gamma        : float
+
+        # Collocation resampling (optional, default off — 0 = reuse the
+        # initial draw for the whole run, as before; N = redraw all N_f
+        # points fresh every N epochs). Ignored whenever use_adaptive_refine
+        # is True for this config — AR manages the collocation set instead,
+        # since full resampling would wipe its targeted picks immediately.
+        resample_every      : int
 
         # L-BFGS params
         lbfgs_max_iter      : int
@@ -451,14 +492,27 @@ def train(model, all_params, domain_params, config, eval_fn=None):
         hist["eval_epochs"].append(0)
         hist["eval_l2_rel"].append(metrics.get("l2_rel", float("nan")))
         hist["eval_max_err"].append(metrics.get("max_err", float("nan")))
-    log_every    = config.get("log_every", 500)
-    use_fd       = config.get("use_fd_deriv", True)
+    log_every      = config.get("log_every", 500)
+    use_fd         = config.get("use_fd_deriv", True)
+    use_ar         = config.get("use_adaptive_refine", False)
+    # Resampling and adaptive refinement both replace points in x_f/y_f/t_f;
+    # full resampling would immediately wipe AR's targeted picks, so when AR
+    # is on for this config, resampling is skipped and AR alone manages the
+    # collocation set.
+    resample_every = config.get("resample_every", 0) if not use_ar else 0
 
     # ---- Adam phase --------------------------------------------------------
     for epoch in range(1, adam_epochs + 1):
+        if resample_every and epoch % resample_every == 0:
+            x_f = X_lo + (X_hi - X_lo) * torch.rand(N_f, 1, device=dev)
+            y_f = Y_lo + (Y_hi - Y_lo) * torch.rand(N_f, 1, device=dev)
+            t_f = T    *                  torch.rand(N_f, 1, device=dev)
+
         losses, _ = compute_losses(
             model, x_f, y_f, t_f, domain_params, K, ic_fn,
             use_fd=use_fd, pde_fn=pde_fn, bc_fn=bc_fn,
+            causal_eps=config.get("causal_eps", 0.0),
+            n_causal_bins=config.get("n_causal_bins", 10),
         )
         weights   = softadapt(losses)
 
@@ -482,7 +536,7 @@ def train(model, all_params, domain_params, config, eval_fn=None):
             hist["eval_max_err"].append(metrics.get("max_err", float("nan")))
 
         # Method 2 — adaptive collocation refinement
-        if config.get("use_adaptive_refine", False) and epoch % refine_every == 0:
+        if use_ar and epoch % refine_every == 0:
             xyt_f = adaptive_refine(
                 model            = model,
                 xyt_old          = torch.cat([x_f, y_f, t_f], dim=1),
@@ -523,6 +577,8 @@ def train(model, all_params, domain_params, config, eval_fn=None):
             losses_c, _ = compute_losses(
                 model, x_f, y_f, t_f, domain_params, K, ic_fn,
                 use_fd=use_fd, pde_fn=pde_fn, bc_fn=bc_fn,
+                causal_eps=config.get("causal_eps", 0.0),
+                n_causal_bins=config.get("n_causal_bins", 10),
             )
             weights_c   = softadapt(losses_c, update=False)
             loss_c      = sum(weights_c[name] * losses_c[name] for name in loss_names)

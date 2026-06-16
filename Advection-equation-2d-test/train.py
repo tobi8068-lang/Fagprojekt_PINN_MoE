@@ -89,8 +89,9 @@ def build_model(cfg, device):
 
 def evaluate(model, device, n_grid=100):
     """
-    Evaluate L2 relative error and L∞ (supremum) over the full (x, y) spatial
-    domain at t = 0, T/2, T.  Returns NaN when no exact solution is available.
+    Evaluate L2 relative error and total (absolute) L2 norm over the full
+    (x, y) spatial domain at t = 0, T/2, T.  Returns NaN when no exact
+    solution is available.
     """
     exact_fn = DOMAIN.get("exact_fn")
     if exact_fn is None:
@@ -127,7 +128,7 @@ def evaluate(model, device, n_grid=100):
     u_exact_all = np.concatenate(u_exact_all)
 
     l2_rel  = float(np.linalg.norm(err_all) / np.linalg.norm(u_exact_all))
-    max_err = float(np.max(np.abs(err_all)))
+    max_err = float(np.linalg.norm(err_all))
     return {"l2_rel": l2_rel, "max_err": max_err}
 
 
@@ -209,7 +210,7 @@ def run_pinn(config_idx, seed, out_dir):
 
     # Final high-resolution evaluation
     final = evaluate(model, device, n_grid=200)
-    print(f"L2 rel: {final['l2_rel']:.4e}  |  Max err: {final['max_err']:.4e}")
+    print(f"L2 rel: {final['l2_rel']:.4e}  |  L2 abs: {final['max_err']:.4e}")
     print(f"Total wall time: {total_time:.1f}s")
 
     grid = solution_grid(model, device, n_grid=200)
@@ -249,6 +250,7 @@ def run_pinn(config_idx, seed, out_dir):
         hist_pde   = hist["pde"],
         hist_ini   = hist["ini"],
         hist_load  = hist["load"],
+        hist_bc    = hist.get("bc", []),
 
         # --- Per-epoch wall time (seconds from start of training) ---
         hist_wall_time = hist["wall_time"],

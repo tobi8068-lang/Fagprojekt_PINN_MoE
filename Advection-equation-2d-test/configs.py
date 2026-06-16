@@ -72,54 +72,44 @@ def exact_fn(x, y, t, domain):
 # --- Boundary conditions --------------------------------------------------
 # bc_fn(model, device, domain) -> scalar loss tensor, or None for no BC loss.
 #
-# Pattern:  for each boundary edge, sample N_bc random (position, time) pairs,
-#           evaluate model there, compare to a target, return mean MSE.
-#           Replace the u_exact block with torch.zeros_like(u_pred) for u=0 BCs.
-#
-# Here we use the known exact solution as Dirichlet data on all four edges.
-# This is valid because exact_fn is defined on all of R² so it gives the true
-# boundary value at any (x_boundary, y, t) or (x, y_boundary, t).
+# Dirichlet data from the known closed-form exact_fn at the four edges of the
+# truncated box. Valid because exact_fn is defined on all of R^2, so it gives
+# the true boundary value at any (x_boundary, y, t) or (x, y_boundary, t) —
+# this problem was previously treated as a pure Cauchy/IC-only problem with
+# no boundary constraint at all (bc_fn = None below), which left the model
+# free to drift near the domain edges as t grows since nothing penalized it
+# for doing so (verified: error concentrated at the edges and grew over time,
+# while the PDE residual + IC loss were already converged to ~1e-6).
+# A previous version of this function implemented a Robin(Danckwerts)+Neumann
+# condition instead, which doesn't actually hold for this Gaussian Cauchy
+# solution (e.g. (u - Dl*u_x) at x=X_lo evaluates to u*(-t/(2(1+t))), not 0)
+# and was never enabled anyway.
 
 def bc_fn(model, device, domain):
-    """
-    BCs from eq. (2.27):
-      Robin (Danckwerts) inlet at x = X_lo:  (C - b*C_x)(X_lo, y, t) = 0
-      Neumann at y = Y_lo:                    C_y(x, Y_lo, t) = 0
-      Neumann at y = Y_hi:                    C_y(x, Y_hi, t) = 0
-    where b = Dl (= D_L/V in dimensionless form with V=1).
-    Derivatives are computed via autograd regardless of the FD flag in training.
-    """
     X_lo, X_hi = domain["X_lo"], domain["X_hi"]
     Y_lo, Y_hi = domain["Y_lo"], domain["Y_hi"]
-    T = domain["T"]
-    b = domain["Dl"]
+    T        = domain["T"]
+    exact_fn = domain["exact_fn"]
     N = 200
 
-    # --- Robin at x = X_lo: (C - b * dC/dx) = 0 ----------------------------
+    def _edge_loss(x, y, t):
+        _, _, u_pred = model(x, y, t)
+        u_exact_np = exact_fn(x.detach().cpu().numpy(), y.detach().cpu().numpy(),
+                               t.detach().cpu().numpy(), domain)
+        u_exact = torch.as_tensor(u_exact_np, dtype=u_pred.dtype, device=u_pred.device)
+        return torch.mean((u_pred - u_exact) ** 2)
+
     t = T * torch.rand(N, 1, device=device)
     y = Y_lo + (Y_hi - Y_lo) * torch.rand(N, 1, device=device)
-    x_left = torch.full((N, 1), X_lo, device=device, requires_grad=True)
-    _, _, u = model(x_left, y, t)
-    u_x = torch.autograd.grad(u.sum(), x_left, create_graph=True)[0]
-    loss_robin = torch.mean((u - b * u_x) ** 2)
+    loss_left  = _edge_loss(torch.full((N, 1), X_lo, device=device), y, t)
+    loss_right = _edge_loss(torch.full((N, 1), X_hi, device=device), y, t)
 
-    # --- Neumann at y = Y_lo: dC/dy = 0 ------------------------------------
     t = T * torch.rand(N, 1, device=device)
     x = X_lo + (X_hi - X_lo) * torch.rand(N, 1, device=device)
-    y_bot = torch.full((N, 1), Y_lo, device=device, requires_grad=True)
-    _, _, u = model(x, y_bot, t)
-    u_y = torch.autograd.grad(u.sum(), y_bot, create_graph=True)[0]
-    loss_neumann_bot = torch.mean(u_y ** 2)
+    loss_bot = _edge_loss(x, torch.full((N, 1), Y_lo, device=device), t)
+    loss_top = _edge_loss(x, torch.full((N, 1), Y_hi, device=device), t)
 
-    # --- Neumann at y = Y_hi: dC/dy = 0 ------------------------------------
-    t = T * torch.rand(N, 1, device=device)
-    x = X_lo + (X_hi - X_lo) * torch.rand(N, 1, device=device)
-    y_top = torch.full((N, 1), Y_hi, device=device, requires_grad=True)
-    _, _, u = model(x, y_top, t)
-    u_y = torch.autograd.grad(u.sum(), y_top, create_graph=True)[0]
-    loss_neumann_top = torch.mean(u_y ** 2)
-
-    return (loss_robin + loss_neumann_bot + loss_neumann_top) / 3.0
+    return (loss_left + loss_right + loss_bot + loss_top) / 4.0
 
 
 # --- BC loss weight (only used when bc_fn is not None) --------------------
@@ -147,7 +137,7 @@ DOMAIN = {
     "ic_fn":    ic_fn,
     "ic_fn_np": ic_fn_np,
     "exact_fn": exact_fn,
-    "bc_fn":    None,   # Cauchy problem — IC only, no spatial BCs
+    "bc_fn":    bc_fn,  # Dirichlet via exact_fn at the 4 edges — see bc_fn above
     "bc_weight": _bc_weight,
 }
 
@@ -165,8 +155,8 @@ _TRAIN_BASE = {
     "adam_epochs":       10000,
     "adam_lr":           1e-3,
     "adam_step_size":    2500,
-    "adam_gamma":        0.5,
-    "base_weights":      {"pde": 10.0, "ini": 10.0, "load": 1e-2},
+    "adam_gamma":        1.0,    # constant LR (was 0.5 step decay) — validated to help
+    "base_weights":      {"pde": 1.0, "ini": 10.0, "load": 1e-2},  # pde was 10.0
     "softadapt_beta":    5.0,
     "refine_every":      100,
     "n_candidates":      8000,
@@ -175,6 +165,11 @@ _TRAIN_BASE = {
     "lbfgs_max_iter":    600,
     "eval_every":        200,
     "log_every":         200,
+    "causal_eps":        1.0,    # causal/temporal weighting of the PDE loss
+    "n_causal_bins":     10,
+    "resample_every":    1,      # redraw collocation points every epoch;
+                                  # ignored for use_adaptive_refine=True configs
+                                  # (AR manages the collocation set instead — see methods.train)
 }
 
 # ---------------------------------------------------------------------------
