@@ -1,6 +1,6 @@
 def create_conditions(Xg, Yg, Tg):
     import torch
-    from config import device, T_scale
+    from config import device
 
     # --- boundaries ---
     venstre = torch.stack([
