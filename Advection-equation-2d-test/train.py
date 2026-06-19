@@ -1,13 +1,8 @@
 """
-Train or solve one (config, seed) pair and save results to results/.
+Train one (config, seed) pair and save results to results/.
 
-PINN usage (via LSF loop in submit_all.sh):
     python train.py --job_id 0              # config 0, seed SEEDS[0]
     python train.py --job_id 42 --n_seeds 8
-
-FD usage (run once per config; deterministic, no seed needed):
-    python train.py --fd_config_idx 0
-    python train.py --fd_config_idx 1
 """
 
 import argparse
@@ -23,9 +18,8 @@ from methods import (
     FeatureMap, ScaledInputs,
     Sin, VanillaPINN, MoEModel,
     train as run_training,
-    numerical_solve,
 )
-from configs import CONFIGS, FD_CONFIGS, SEEDS, DOMAIN
+from configs import CONFIGS, SEEDS, DOMAIN
 
 # ---------------------------------------------------------------------------
 # Network architecture
@@ -33,10 +27,8 @@ from configs import CONFIGS, FD_CONFIGS, SEEDS, DOMAIN
 
 N_FEATURES = 11   # RFF frequencies → out_dim = 2 * N_FEATURES = 22
 
-# Widths chosen so vanilla and MoE have the same total parameter count.
-# Vanilla always uses w=64.  MoE expert width depends on use_rff because
-# removing RFF shrinks each of the 3 expert first layers (22→w vs 3→w),
-# creating a larger gap than vanilla's single first layer.
+# Widths chosen to match total parameter count across vanilla and MoE.
+# MoE expert width varies with use_rff because RFF changes the input dimension.
 #   RFF  (in_dim=22): vanilla=14 017,  MoE 3×34+gate=13 580  (−3%)
 #   noRFF(in_dim= 3): vanilla=12 801,  MoE 3×36+gate=12 646  (−1%)
 _VANILLA_WIDTH          = 64
@@ -89,9 +81,8 @@ def build_model(cfg, device):
 
 def evaluate(model, device, n_grid=100):
     """
-    Evaluate L2 relative error and total (absolute) L2 norm over the full
-    (x, y) spatial domain at t = 0, T/2, T.  Returns NaN when no exact
-    solution is available.
+    Compute relative L2 error and absolute L2 error on a grid at t = 0, T/2, T.
+    Returns NaN if no exact solution is available.
     """
     exact_fn = DOMAIN.get("exact_fn")
     if exact_fn is None:
@@ -155,6 +146,7 @@ def solution_grid(model, device, n_grid=200):
     t_vals = [0.0, T / 2.0, T]
     u_pred_snaps  = []
     u_exact_snaps = []
+    gate_snaps    = []   # (3, n_grid, n_grid, n_experts) — empty for VanillaPINN
 
     for t_val in t_vals:
         tg = np.full_like(xg, t_val)
@@ -164,8 +156,10 @@ def solution_grid(model, device, n_grid=200):
         t_t = torch.tensor(tg.reshape(-1, 1), dtype=torch.float32, device=device)
 
         with torch.no_grad():
-            _, _, u = model(x_t, y_t, t_t)
+            gates, _, u = model(x_t, y_t, t_t)
         u_pred_snaps.append(u.cpu().numpy().reshape(n_grid, n_grid))
+        # gates: (N, n_experts); reshape to (n_grid, n_grid, n_experts)
+        gate_snaps.append(gates.cpu().numpy().reshape(n_grid, n_grid, -1))
 
         if exact_fn is not None:
             ue = exact_fn(xg, yg, tg, DOMAIN)
@@ -179,6 +173,7 @@ def solution_grid(model, device, n_grid=200):
         "grid_t_vals":  np.array(t_vals),
         "grid_u_pred":  np.array(u_pred_snaps),   # (3, n_grid, n_grid)
         "grid_u_exact": np.array(u_exact_snaps),  # (3, n_grid, n_grid)
+        "grid_gates":   np.array(gate_snaps),      # (3, n_grid, n_grid, n_experts)
     }
 
 
@@ -270,61 +265,10 @@ def run_pinn(config_idx, seed, out_dir):
         grid_t_vals  = grid["grid_t_vals"],
         grid_u_pred  = grid["grid_u_pred"],
         grid_u_exact = grid["grid_u_exact"],
+        grid_gates   = grid["grid_gates"],     # (3, n_grid, n_grid, n_experts)
 
         # --- Timing ---
         total_time_sec = total_time,
-    )
-    print(f"Saved: {out_path}")
-
-
-# ---------------------------------------------------------------------------
-# Finite-difference runner
-# ---------------------------------------------------------------------------
-
-def run_fd(fd_config_idx, out_dir):
-    cfg = FD_CONFIGS[fd_config_idx]
-    print(f"[FD] Config: {cfg['name']}  N_y={cfg['N_y']}")
-
-    result = numerical_solve(DOMAIN, N_y=cfg["N_y"], N_t_plot=cfg.get("N_t_plot", 1000))
-
-    print(f"L2 rel: {result['l2_rel_final']:.4e}  |  Max err: {result['max_err_final']:.4e}")
-    print(f"Solve time: {result['solve_time_sec']:.3f}s")
-
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{cfg['name']}.npz")
-
-    np.savez(
-        out_path,
-        # --- Identity ---
-        solver      = "fd",
-        config_name = cfg["name"],
-
-        # --- Domain ---
-        Y = DOMAIN["Y"],
-        T = DOMAIN["T"],
-        c = DOMAIN["c"],
-        v = DOMAIN["v"],
-
-        # --- Grid parameters ---
-        N_y     = result["N_y"],
-        N_t_plot= result["N_t_plot"],
-
-        # --- Solution at final time ---
-        u_final       = result["u_final"],
-        u_exact_final = result["u_exact_final"],
-        y_grid        = result["y_grid"],
-
-        # --- Error at every time step ---
-        t_grid          = result["t_grid"],
-        l2_rel_history  = result["l2_rel_history"],
-        max_err_history = result["max_err_history"],
-
-        # --- Final summary errors ---
-        l2_rel_final  = result["l2_rel_final"],
-        max_err_final = result["max_err_final"],
-
-        # --- Timing ---
-        solve_time_sec = result["solve_time_sec"],
     )
     print(f"Saved: {out_path}")
 
@@ -346,18 +290,9 @@ def main():
                         help="Explicit seed value (use with --config_idx)")
     parser.add_argument("--out_dir",    type=str, default="results")
 
-    # FD mode
-    parser.add_argument("--fd_config_idx", type=int, default=None,
-                        help="Run a finite-difference config instead of PINN")
-
     args = parser.parse_args()
 
-    if args.fd_config_idx is not None:
-        if args.fd_config_idx >= len(FD_CONFIGS):
-            sys.exit(f"fd_config_idx {args.fd_config_idx} out of range (max {len(FD_CONFIGS)-1})")
-        run_fd(args.fd_config_idx, args.out_dir)
-
-    elif args.config_idx is not None and args.seed is not None:
+    if args.config_idx is not None and args.seed is not None:
         if args.config_idx >= len(CONFIGS):
             sys.exit(f"config_idx {args.config_idx} out of range (max {len(CONFIGS)-1})")
         run_pinn(args.config_idx, args.seed, args.out_dir)

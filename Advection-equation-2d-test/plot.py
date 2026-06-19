@@ -40,6 +40,16 @@ def _s(d, key, default=""):
     return v.item() if hasattr(v, "item") else v
 
 
+def _smooth(arr, w):
+    """Centered moving average with edge-value padding to avoid boundary dip."""
+    arr = np.asarray(arr, dtype=float)
+    if len(arr) <= w:
+        return arr.copy()
+    pad    = w // 2
+    padded = np.concatenate([np.full(pad, arr[0]), arr, np.full(pad, arr[-1])])
+    return np.convolve(padded, np.ones(w) / w, mode="valid")[:len(arr)]
+
+
 _MOD_LABELS = [
     ("rff", "Fourier Features"),
     ("fd",  "Finite Diff."),
@@ -196,22 +206,52 @@ def fig_ranking(ranked, fd_df, top=15, save_dir="figures"):
     _save(fig, save_dir, "1_ranking.png")
 
 
+# Epoch-axis placeholder for the post-L-BFGS result; must exceed adam_epochs (10000).
+_LBFGS_TICK = 11500
+
+
+def _inject_lbfgs(d, ep, l2, wt_at_eval):
+    """Append the post-L-BFGS eval point at _LBFGS_TICK; handles missing or duplicate entry."""
+    if not bool(_s(d, "use_lbfgs", False)) or "l2_rel_final" not in d:
+        return ep, l2, wt_at_eval, False
+    l2_final = float(_s(d, "l2_rel_final"))
+    t_final  = float(_s(d, "total_time_sec", wt_at_eval[-1]))
+    # New runs record the point at adam_epochs (same x as last Adam eval); remove it.
+    if len(ep) >= 2 and ep[-1] == ep[-2]:
+        ep = ep[:-1]; l2 = l2[:-1]; wt_at_eval = wt_at_eval[:-1]
+    ep         = np.append(ep, _LBFGS_TICK)
+    l2         = np.append(l2, l2_final)
+    wt_at_eval = np.append(wt_at_eval, t_final)
+    return ep, l2, wt_at_eval, True
+
+
+def _fix_lbfgs_ticks(ax):
+    """Replace the sentinel x-tick with an 'L-BFGS' label and add a separator."""
+    ax.axvline(10050, color="gray", lw=0.9, ls="--", alpha=0.55)
+    ax.set_xticks([0, 2000, 4000, 6000, 8000, 10000, _LBFGS_TICK])
+    ax.set_xticklabels(["0", "2k", "4k", "6k", "8k", "10k", "L-BFGS"])
+    ax.tick_params(axis="x", which="major", pad=4)
+    plt.setp(ax.get_xticklabels()[-2:], rotation=30, ha="right")
+
+
 # ---------------------------------------------------------------------------
 # Figure 2 — Convergence curves (top 5 configs)
 # ---------------------------------------------------------------------------
 
-def fig_convergence(pinn_df, ranked, top=5, save_dir="figures"):
+def fig_convergence(pinn_df, ranked, fd_df=None, top=5, save_dir="figures"):
     top_names = ranked.head(top)["name"].tolist()
     colors    = plt.cm.tab10(np.linspace(0, 0.9, top))
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
-    (ax_l2_ep, ax_l2_t), (ax_li_ep, ax_li_t) = axes
+    fig, (ax_l2_ep, ax_l2_t) = plt.subplots(1, 2, figsize=(13, 5))
 
-    min_max_wt = np.inf   # shortest run's final wall-clock time → x-axis cutoff
+    min_max_wt  = np.inf
+    has_lbfgs   = False
+    term_labels = []   # (x, y, text, color) added after loop to avoid overlap
 
     for color, name in zip(colors, top_names):
         subset = pinn_df[pinn_df["name"] == name]
-        all_l2, all_li, all_ep, all_wt = [], [], [], []
+        all_l2, all_ep, all_wt = [], [], []
+        final_l2_vals = []
 
         for _, row in subset.iterrows():
             d  = np.load(row["_path"], allow_pickle=True)
@@ -220,10 +260,14 @@ def fig_convergence(pinn_df, ranked, top=5, save_dir="figures"):
             wt = d["hist_wall_time"].astype(float)
             if len(ep) == 0:
                 continue
-            li = d["eval_max_err"].astype(float) if "eval_max_err" in d else np.full_like(l2, np.nan)
-            # epoch 0 is before training → wall time = 0; epochs ≥1 index into wt
             wt_at_eval = np.array([0.0 if e == 0 else wt[int(e) - 1] for e in ep])
-            all_ep.append(ep); all_l2.append(l2); all_li.append(li); all_wt.append(wt_at_eval)
+            ep, l2, wt_at_eval, injected = _inject_lbfgs(d, ep, l2, wt_at_eval)
+            has_lbfgs = has_lbfgs or injected
+            # Snap terminal point to the 200×200 recomputed L2 used in ranking
+            l2[-1] = row["l2_rel"]
+            wt_at_eval[-1] = row["time_sec"]
+            final_l2_vals.append(row["l2_rel"])
+            all_ep.append(ep); all_l2.append(l2); all_wt.append(wt_at_eval)
 
         if not all_l2:
             continue
@@ -232,39 +276,51 @@ def fig_convergence(pinn_df, ranked, top=5, save_dir="figures"):
         ep_ref = all_ep[0][:n]
         wt_ref = np.mean([x[:n] for x in all_wt], axis=0)
         lbl    = pretty_name(name)
-
         min_max_wt = min(min_max_wt, wt_ref[-1])
 
-        for (ax_ep, ax_t), all_vals, ylabel in [
-            ((ax_l2_ep, ax_l2_t), all_l2, "L2"),
-            ((ax_li_ep, ax_li_t), all_li, "Linf"),
-        ]:
-            mat  = np.array([x[:n] for x in all_vals])
-            mean = mat.mean(axis=0)
-            std  = mat.std(axis=0)
-            for ax, xs in [(ax_ep, ep_ref), (ax_t, wt_ref)]:
-                ax.semilogy(xs, mean, color=color,
-                            label=lbl if (ax is ax_l2_ep) else None, lw=1.8)
-                ax.fill_between(xs,
-                                np.maximum(mean - std, 1e-12),
-                                mean + std,
-                                color=color, alpha=0.12)
+        mat    = np.array([x[:n] for x in all_l2])
+        sm_mat = np.array([_smooth(r, w=5) for r in mat])
+        sm     = sm_mat.mean(axis=0)
+        # Snap final point to true value — smoothing window would otherwise blend the L-BFGS drop.
+        final_mean = float(np.mean(final_l2_vals))
+        sm_mat[:, -1] = np.array(final_l2_vals)
+        sm[-1] = final_mean
+        log_std = np.std(np.log(np.maximum(sm_mat, 1e-30)), axis=0)
+        for ax, xs in [(ax_l2_ep, ep_ref), (ax_l2_t, wt_ref)]:
+            ax.semilogy(xs, sm, color=color,
+                        label=lbl if ax is ax_l2_ep else None, lw=1.8)
+            ax.fill_between(xs,
+                            sm * np.exp(-log_std),
+                            sm * np.exp(+log_std),
+                            color=color, alpha=0.12)
+
+        term_labels.append((ep_ref[-1], final_mean, f"{final_mean:.2e}", color))
 
     if np.isfinite(min_max_wt):
         ax_l2_t.set_xlim(left=0, right=min_max_wt)
-        ax_li_t.set_xlim(left=0, right=min_max_wt)
 
-    for ax, xlabel, ylabel, title in [
-        (ax_l2_ep, "Epoch",          "L2 relative error",  f"Top {top} — L2 (relative) vs epoch"),
-        (ax_l2_t,  "Wall-clock (s)", "L2 relative error",  f"Top {top} — L2 (relative) vs time"),
-        (ax_li_ep, "Epoch",          "L2 norm (absolute)", f"Top {top} — L2 (total) vs epoch"),
-        (ax_li_t,  "Wall-clock (s)", "L2 norm (absolute)", f"Top {top} — L2 (total) vs time"),
+    for x, y, txt, color in term_labels:
+        ax_l2_ep.annotate(txt, xy=(x, y), xytext=(5, 0),
+                          textcoords="offset points",
+                          color=color, fontsize=6, va="center")
+
+    if fd_df is not None and not fd_df.empty:
+        for _, row in fd_df.iterrows():
+            for ax in (ax_l2_ep, ax_l2_t):
+                ax.axhline(row["l2_rel"], color="steelblue", lw=1.2, ls="--",
+                           label=f"FD {row['name']} ({row['l2_rel']:.2e})")
+
+    for ax, xlabel, title in [
+        (ax_l2_ep, "Epoch",          f"Top {top} — L2 relative vs epoch (smoothed, w=5)"),
+        (ax_l2_t,  "Wall-clock (s)", f"Top {top} — L2 relative vs time (smoothed, w=5)"),
     ]:
         ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
+        ax.set_ylabel("L2 relative error")
         ax.set_title(title)
         ax.grid(True, which="both", ls=":", alpha=0.4)
 
+    if has_lbfgs:
+        _fix_lbfgs_ticks(ax_l2_ep)
     ax_l2_ep.legend(fontsize=6, loc="upper right")
 
     fig.tight_layout()
@@ -275,9 +331,7 @@ def fig_convergence(pinn_df, ranked, top=5, save_dir="figures"):
 # Figure 6 — Curated convergence: top-3, best vanilla, best MoE, median
 # ---------------------------------------------------------------------------
 
-def fig_convergence_curated(pinn_df, ranked, save_dir="figures"):
-    names_ordered = ranked["name"].tolist()   # rank-ordered (best first)
-
+def fig_convergence_curated(pinn_df, ranked, fd_df=None, save_dir="figures"):
     van_ranked = ranked[ranked["use_moe"] == False]
     moe_ranked = ranked[ranked["use_moe"] == True]
     best_van   = van_ranked.iloc[0]["name"];  van_rank = int(van_ranked.index[0])
@@ -285,43 +339,25 @@ def fig_convergence_curated(pinn_df, ranked, save_dir="figures"):
     med_row    = ranked.iloc[len(ranked) // 2]
     med_name   = med_row["name"];             med_rank = int(med_row.name)
 
-    # Build ordered dict: name → short label (rank + pretty name + roles)
-    selected = {}
-    for r in ranked.head(3).itertuples():
-        selected[r.name] = f"#{r.Index} {pretty_name(r.name)}"
-
-    # Annotate or add best vanilla
-    if best_van in selected:
-        selected[best_van] += " (best vanilla)"
-    else:
-        selected[best_van] = f"#{van_rank} {pretty_name(best_van)} (best vanilla)"
-
-    # Annotate or add best MoE
-    if best_moe in selected:
-        selected[best_moe] += " (best MoE)"
-    else:
-        selected[best_moe] = f"#{moe_rank} {pretty_name(best_moe)} (best MoE)"
-
-    # Annotate or add median
-    if med_name in selected:
-        selected[med_name] += " (median)"
-    else:
-        selected[med_name] = f"#{med_rank} {pretty_name(med_name)} (median)"
-
-    # Sort by rank
+    selected = {
+        best_moe: (f"#{moe_rank} {pretty_name(best_moe)} (best MoE)", "--"),
+        best_van: (f"#{van_rank} {pretty_name(best_van)} (best Vanilla)", "-"),
+        med_name: (f"#{med_rank} {pretty_name(med_name)} (median)", ":"),
+    }
+    names_ordered = ranked["name"].tolist()
     ordered = sorted(selected.keys(), key=lambda n: names_ordered.index(n))
-    colors  = plt.cm.tab10(np.linspace(0, 0.9, len(ordered)))
+    colors  = ["#e87c2a", "#4c78d4", "#555555"]
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
-    (ax_l2_ep, ax_l2_t), (ax_li_ep, ax_li_t) = axes
-
-    min_max_wt = np.inf
+    fig, (ax_ep, ax_t) = plt.subplots(1, 2, figsize=(13, 5))
+    has_lbfgs    = False
+    term_ep      = []   # (x_ep, y, txt, color)
+    term_t       = []   # (x_t,  y, txt, color)
 
     for color, name in zip(colors, ordered):
-        use_moe = ranked[ranked["name"] == name]["use_moe"].iloc[0]
-        ls      = "--" if use_moe else "-"
+        lbl, ls = selected[name]
         subset  = pinn_df[pinn_df["name"] == name]
-        all_l2, all_li, all_ep, all_wt = [], [], [], []
+        all_l2, all_ep, all_wt = [], [], []
+        final_l2_vals = []
 
         for _, row in subset.iterrows():
             d  = np.load(row["_path"], allow_pickle=True)
@@ -330,9 +366,14 @@ def fig_convergence_curated(pinn_df, ranked, save_dir="figures"):
             wt = d["hist_wall_time"].astype(float)
             if len(ep) == 0:
                 continue
-            li = d["eval_max_err"].astype(float) if "eval_max_err" in d else np.full_like(l2, np.nan)
             wt_at_eval = np.array([0.0 if e == 0 else wt[int(e) - 1] for e in ep])
-            all_ep.append(ep); all_l2.append(l2); all_li.append(li); all_wt.append(wt_at_eval)
+            ep, l2, wt_at_eval, injected = _inject_lbfgs(d, ep, l2, wt_at_eval)
+            has_lbfgs = has_lbfgs or injected
+            # Snap terminal point to the 200×200 recomputed L2 used in ranking
+            l2[-1] = row["l2_rel"]
+            wt_at_eval[-1] = row["time_sec"]
+            final_l2_vals.append(row["l2_rel"])
+            all_ep.append(ep); all_l2.append(l2); all_wt.append(wt_at_eval)
 
         if not all_l2:
             continue
@@ -340,38 +381,56 @@ def fig_convergence_curated(pinn_df, ranked, save_dir="figures"):
         n      = min(len(x) for x in all_l2)
         ep_ref = all_ep[0][:n]
         wt_ref = np.mean([x[:n] for x in all_wt], axis=0)
-        lbl    = selected[name]
-        min_max_wt = min(min_max_wt, wt_ref[-1])
 
-        for (ax_ep, ax_t), all_vals in [
-            ((ax_l2_ep, ax_l2_t), all_l2),
-            ((ax_li_ep, ax_li_t), all_li),
-        ]:
-            mat  = np.array([x[:n] for x in all_vals])
-            mean = mat.mean(axis=0)
-            std  = mat.std(axis=0)
-            for ax, xs in [(ax_ep, ep_ref), (ax_t, wt_ref)]:
-                ax.semilogy(xs, mean, color=color, ls=ls,
-                            label=lbl if ax is ax_l2_ep else None, lw=1.8)
-                ax.fill_between(xs,
-                                np.maximum(mean - std, 1e-12),
-                                mean + std, color=color, alpha=0.12)
+        mat    = np.array([x[:n] for x in all_l2])
+        sm_mat = np.array([_smooth(r, w=3) for r in mat])
+        sm     = sm_mat.mean(axis=0)
+        # Snap final point to true value — smoothing would otherwise raise sm[-1].
+        final_mean = float(np.mean(final_l2_vals))
+        sm_mat[:, -1] = np.array(final_l2_vals)
+        sm[-1] = final_mean
+        log_std = np.std(np.log(np.maximum(sm_mat, 1e-30)), axis=0)
+        for ax, xs in [(ax_ep, ep_ref), (ax_t, wt_ref)]:
+            ax.semilogy(xs, sm, color=color, ls=ls,
+                        label=lbl if ax is ax_ep else None, lw=1.8)
+            ax.fill_between(xs,
+                            sm * np.exp(-log_std),
+                            sm * np.exp(+log_std),
+                            color=color, alpha=0.15)
 
-    if np.isfinite(min_max_wt):
-        ax_l2_t.set_xlim(left=0, right=min_max_wt)
-        ax_li_t.set_xlim(left=0, right=min_max_wt)
+        # Vertical end-of-run marker on time axis
+        ax_t.axvline(wt_ref[-1], color=color, lw=0.8, ls=":", alpha=0.6)
 
-    for ax, xlabel, ylabel, title in [
-        (ax_l2_ep, "Epoch",          "L2 relative error",  "Curated — L2 (relative) vs epoch"),
-        (ax_l2_t,  "Wall-clock (s)", "L2 relative error",  "Curated — L2 (relative) vs time"),
-        (ax_li_ep, "Epoch",          "L2 norm (absolute)", "Curated — L2 (total) vs epoch"),
-        (ax_li_t,  "Wall-clock (s)", "L2 norm (absolute)", "Curated — L2 (total) vs time"),
+        term_ep.append((ep_ref[-1], final_mean, f"{final_mean:.2e}", color))
+        term_t.append( (wt_ref[-1], final_mean, f"{final_mean:.2e}", color))
+
+    for x, y, txt, color in term_ep:
+        ax_ep.annotate(txt, xy=(x, y), xytext=(5, 0),
+                       textcoords="offset points",
+                       color=color, fontsize=7, va="center")
+    for x, y, txt, color in term_t:
+        ax_t.annotate(txt, xy=(x, y), xytext=(5, 0),
+                      textcoords="offset points",
+                      color=color, fontsize=7, va="center")
+
+    if fd_df is not None and not fd_df.empty:
+        for _, row in fd_df.iterrows():
+            for ax in (ax_ep, ax_t):
+                ax.axhline(row["l2_rel"], color="steelblue", lw=1.2, ls="--",
+                           label=f"FD {row['name']} ({row['l2_rel']:.2e})")
+
+    for ax, xlabel, title in [
+        (ax_ep, "Epoch",          "L2 relative vs epoch (smoothed, w=3)"),
+        (ax_t,  "Wall-clock (s)", "L2 relative vs time (smoothed, w=3)"),
     ]:
-        ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
-        ax.set_title(title);   ax.grid(True, which="both", ls=":", alpha=0.4)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("L2 relative error")
+        ax.set_title(title)
+        ax.grid(True, which="both", ls=":", alpha=0.4)
 
-    ax_l2_ep.legend(fontsize=6, loc="upper right",
-                    title="solid=vanilla  dashed=MoE", title_fontsize=7)
+    if has_lbfgs:
+        _fix_lbfgs_ticks(ax_ep)
+    ax_ep.legend(fontsize=7, loc="upper right")
     fig.tight_layout()
     _save(fig, save_dir, "6_convergence_curated.png")
 
@@ -574,6 +633,76 @@ def fig_heatmaps(pinn_df, ranked, save_dir="figures"):
 
 
 # ---------------------------------------------------------------------------
+# Figure 7 — loss component breakdown for curated configs
+# ---------------------------------------------------------------------------
+
+def fig_loss_breakdown(pinn_df, ranked, save_dir="figures"):
+    van_ranked = ranked[ranked["use_moe"] == False]
+    moe_ranked = ranked[ranked["use_moe"] == True]
+    best_van   = van_ranked.iloc[0]["name"];  van_rank = int(van_ranked.index[0])
+    best_moe   = moe_ranked.iloc[0]["name"];  moe_rank = int(moe_ranked.index[0])
+    med_row    = ranked.iloc[len(ranked) // 2]
+    med_name   = med_row["name"];             med_rank = int(med_row.name)
+
+    selected = {
+        best_moe: (f"#{moe_rank} {pretty_name(best_moe)} (best MoE)", "--"),
+        best_van: (f"#{van_rank} {pretty_name(best_van)} (best Vanilla)", "-"),
+        med_name: (f"#{med_rank} {pretty_name(med_name)} (median)", ":"),
+    }
+    names_ordered = ranked["name"].tolist()
+    ordered = sorted(selected.keys(), key=lambda n: names_ordered.index(n))
+    colors  = ["#e87c2a", "#4c78d4", "#555555"]
+
+    components = [("pde", "PDE loss"), ("ini", "IC loss"), ("bc", "BC loss")]
+    fig, axes  = plt.subplots(1, 3, figsize=(15, 4), sharey=False)
+
+    W = 300  # smoothing window for per-epoch loss history
+
+    for color, name in zip(colors, ordered):
+        lbl, ls = selected[name]
+        subset  = pinn_df[pinn_df["name"] == name]
+
+        all_losses = {key: [] for key, _ in components}
+        epoch_ref  = None
+
+        for _, row in subset.iterrows():
+            d = np.load(row["_path"], allow_pickle=True)
+            for key, _ in components:
+                arr_key = f"hist_{key}"
+                if arr_key in d and len(d[arr_key]) > 0:
+                    all_losses[key].append(np.array(d[arr_key], dtype=float))
+            if epoch_ref is None and "hist_pde" in d and len(d["hist_pde"]) > 0:
+                epoch_ref = np.arange(len(d["hist_pde"]))
+
+        if epoch_ref is None:
+            continue
+
+        for ax, (key, title) in zip(axes, components):
+            arrs = all_losses[key]
+            if not arrs:
+                continue
+            n    = min(len(a) for a in arrs)
+            mat  = np.array([a[:n] for a in arrs])
+            mean = mat.mean(axis=0)
+            sm   = _smooth(mean, w=W)
+            xs   = epoch_ref[:n]
+            ax.semilogy(xs, mean, color=color, ls=ls, lw=0.5, alpha=0.15)
+            ax.semilogy(xs, sm,   color=color, ls=ls, lw=1.8,
+                        label=lbl if ax is axes[0] else None)
+
+    for ax, (_, title) in zip(axes, components):
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.grid(True, which="both", ls=":", alpha=0.4)
+
+    axes[0].legend(fontsize=7, loc="upper right")
+    fig.suptitle(f"Loss component breakdown — curated configs (smoothed, w={W})", fontsize=11)
+    fig.tight_layout()
+    _save(fig, save_dir, "7_loss_breakdown.png")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -610,8 +739,9 @@ def main():
 
     print("Generating figures...")
     fig_ranking(ranked,    fd_df,  top=args.top,  save_dir=args.figures)
-    fig_convergence(pinn_df, ranked, top=5,         save_dir=args.figures)
-    fig_convergence_curated(pinn_df, ranked,         save_dir=args.figures)
+    fig_convergence(pinn_df, ranked, fd_df=fd_df, top=5, save_dir=args.figures)
+    fig_convergence_curated(pinn_df, ranked, fd_df=fd_df, save_dir=args.figures)
+    fig_loss_breakdown(pinn_df, ranked,              save_dir=args.figures)
     fig_toggles(pinn_df,                            save_dir=args.figures)
     fig_time_vs_error(pinn_df, fd_df,               save_dir=args.figures)
     fig_heatmaps(pinn_df, ranked,                   save_dir=args.figures)

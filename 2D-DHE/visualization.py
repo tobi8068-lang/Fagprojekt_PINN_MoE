@@ -37,13 +37,13 @@ def animate_solution(model, device, N=100):
         X_plot = X.cpu().numpy()
         Y_plot = Y.cpu().numpy()
 
-        ax.plot_surface(X_plot, Y_plot, u_pred, cmap='hot',vmin=0,vmax=T_scale)
+        ax.plot_surface(X_plot, Y_plot, u_pred, cmap='hot',vmin=0,vmax=T_SCALE)
         t_physical = t_val * T_TIME
         ax.set_title(f"u(x,y,t={t_physical:.0f}s),  τ={t_val:.3f}")
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         ax.set_zlabel("u")
-        ax.set_zlim(0, T_scale)
+        ax.set_zlim(0, T_SCALE)
 
     ani = FuncAnimation(fig, update, frames=len(times), interval=80)
     return HTML(ani.to_jshtml())

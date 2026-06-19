@@ -1,22 +1,12 @@
 """
 Sweep configurations.
 
-DOMAIN      — PDE / domain parameters + all equation definitions (edit at top).
-SEEDS       — 5 seeds used for the main sweep.
-CONFIGS     — 22 PINN configs: 2 model types × 11 method combos.
-FD_CONFIGS  — 2 upwind finite-difference reference runs (no seed needed).
+DOMAIN   — PDE parameters and equation callables (edit at top to change PDE).
+SEEDS    — 5 seeds for the main sweep.
+CONFIGS  — 34 PINN configs: 2 model types × (16 combos + 1 all-on).
 
-Feature map : Random Fourier Features (Tancik et al. 2020) — fixed for all configs.
-Model types : vanilla | moe_cont  (continuous softmax gating)
-Method combos: all (FD, SA, AR, LB) tuples with at most 2 active  → 11 combos
-  FD = use finite-difference derivatives instead of autograd
-
-Main sweep  : 22 configs × 5 seeds = 110 jobs
-Follow-up   : fill in TOP_N_NAMES after ranking, then set SWEEP = "followup"
-              → adds all-4-enhancement variants for those configs
-
-Job ID n maps to:  config_idx = n // len(SEEDS),  seed = SEEDS[n % len(SEEDS)]
-Reference jobs:    python train.py --fd_config_idx 0
+Main sweep: 34 configs × 5 seeds = 170 jobs.
+Job ID n  : config_idx = n // len(SEEDS),  seed = SEEDS[n % len(SEEDS)].
 """
 
 import math
@@ -72,18 +62,8 @@ def exact_fn(x, y, t, domain):
 # --- Boundary conditions --------------------------------------------------
 # bc_fn(model, device, domain) -> scalar loss tensor, or None for no BC loss.
 #
-# Dirichlet data from the known closed-form exact_fn at the four edges of the
-# truncated box. Valid because exact_fn is defined on all of R^2, so it gives
-# the true boundary value at any (x_boundary, y, t) or (x, y_boundary, t) —
-# this problem was previously treated as a pure Cauchy/IC-only problem with
-# no boundary constraint at all (bc_fn = None below), which left the model
-# free to drift near the domain edges as t grows since nothing penalized it
-# for doing so (verified: error concentrated at the edges and grew over time,
-# while the PDE residual + IC loss were already converged to ~1e-6).
-# A previous version of this function implemented a Robin(Danckwerts)+Neumann
-# condition instead, which doesn't actually hold for this Gaussian Cauchy
-# solution (e.g. (u - Dl*u_x) at x=X_lo evaluates to u*(-t/(2(1+t))), not 0)
-# and was never enabled anyway.
+# Dirichlet BC: penalizes deviation from exact_fn on all 4 edges.
+# Without this the model drifts near domain boundaries as t grows.
 
 def bc_fn(model, device, domain):
     X_lo, X_hi = domain["X_lo"], domain["X_hi"]
@@ -165,11 +145,7 @@ _TRAIN_BASE = {
     "lbfgs_max_iter":    600,
     "eval_every":        200,
     "log_every":         200,
-    "causal_eps":        1.0,    # causal/temporal weighting of the PDE loss
-    "n_causal_bins":     10,
-    "resample_every":    1,      # redraw collocation points every epoch;
-                                  # ignored for use_adaptive_refine=True configs
-                                  # (AR manages the collocation set instead — see methods.train)
+    "resample_every":    1,      # redraw all N_f collocation points every epoch (AR configs ignore this)
 }
 
 # ---------------------------------------------------------------------------
@@ -227,82 +203,17 @@ def _build_main():
     return configs   # 2 models × (16 combos + 1 all-on) = 34
 
 
-# ---------------------------------------------------------------------------
-# Follow-up sweep — re-run top-N configs with all 4 enhancements enabled
-#
-# After running the main sweep:
-#   1. Run: python plot.py --results results
-#   2. Copy the top config names from the printed table into TOP_N_NAMES
-#   3. Set SWEEP = "followup" and re-submit
-# ---------------------------------------------------------------------------
-
-TOP_N_NAMES = [
-    # e.g. "moe_cont_fd1_sa1_ar0_lb0",
-]
-
-
-def _build_followup():
-    """For each name in TOP_N_NAMES, generate the all-4-enhancements variant."""
-    main_lookup = {cfg["name"]: cfg for cfg in _build_main()}
-    configs = []
-    for name in TOP_N_NAMES:
-        if name not in main_lookup:
-            raise ValueError(f"'{name}' not found in main configs — check spelling")
-        base = main_lookup[name]
-        cfg = dict(base)
-        cfg["base_weights"] = dict(base["base_weights"])
-        cfg.update({
-            "use_rff":             True,
-            "use_fd_deriv":        True,
-            "use_softadapt":       True,
-            "use_adaptive_refine": True,
-            "use_lbfgs":           True,
-            "name":                name.split("_rff")[0] + "_rff1_fd1_sa1_ar1_lb1",
-        })
-        if not (base["use_rff"] and base["use_fd_deriv"] and base["use_softadapt"]
-                and base["use_adaptive_refine"] and base["use_lbfgs"]):
-            configs.append(cfg)
-    return configs
-
-
-# ---------------------------------------------------------------------------
-# *** SET YOUR SWEEP HERE ***
-#   "main"     → 34 configs, 5 seeds  (170 jobs)
-#   "followup" → len(TOP_N_NAMES) configs, 5 seeds  (fill in TOP_N_NAMES first)
-# ---------------------------------------------------------------------------
-
-SWEEP = "main"
-
-# ---------------------------------------------------------------------------
-
-if SWEEP == "main":
-    CONFIGS = _build_main()
-    SEEDS   = _ALL_SEEDS
-elif SWEEP == "followup":
-    CONFIGS = _build_followup()
-    SEEDS   = _ALL_SEEDS
-else:
-    raise ValueError(f"Unknown SWEEP value: '{SWEEP}'")
-
-# ---------------------------------------------------------------------------
-# Reference solver configs
-# ---------------------------------------------------------------------------
-
-FD_CONFIGS = [
-    {"solver": "fd", "name": "ref_N512",  "N_y": 512,  "N_t_plot": 1000},
-    {"solver": "fd", "name": "ref_N1024", "N_y": 1024, "N_t_plot": 1000},
-]
+CONFIGS = _build_main()
+SEEDS   = _ALL_SEEDS
 
 # ---------------------------------------------------------------------------
 # Sanity check
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"Sweep         : {SWEEP}")
     print(f"PINN configs  : {len(CONFIGS)}")
     print(f"Seeds         : {SEEDS}")
     print(f"Total jobs    : {len(CONFIGS) * len(SEEDS)}")
-    print(f"FD configs    : {len(FD_CONFIGS)}")
     print()
     for i, cfg in enumerate(CONFIGS):
         print(f"[{i:02d}] {cfg['name']}")

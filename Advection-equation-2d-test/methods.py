@@ -1,6 +1,5 @@
 import math
 import time
-from collections import defaultdict
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,14 +19,8 @@ class Sin(nn.Module):
 class FeatureMap(nn.Module):
     """
     Random Fourier Features (Tancik et al. 2020).
-
-    Draws a random frequency matrix B ~ N(0, σ²) at init (fixed thereafter).
-    Maps d coordinates to R^{2m}, normalising each to [0, 1] via its (lo, hi) bounds.
-    bounds : list of (lo, hi) per dimension, e.g. [(-10,10), (-10,10), (0,3)].
-
-    The inner product γ(x)^T γ(x') ≈ exp(-‖x-x'‖²/2σ²) approximates a
-    Gaussian kernel, giving the network a spectral bias towards smooth
-    functions and helping it learn high-frequency components of the PDE solution.
+    Maps d input coordinates to a 2m-dimensional feature vector via a fixed random
+    frequency matrix. bounds: list of (lo, hi) per input dimension.
     """
 
     def __init__(self, bounds, n_features=11, sigma=1.0, rff_seed=0):
@@ -48,7 +41,6 @@ class FeatureMap(nn.Module):
         return 2 * self.B.shape[1]
 
     def forward(self, *coords):
-        # coords: d tensors each of shape (N, 1); normalise to [0, 1]
         x    = torch.cat([(c - l) / (h - l) for c, l, h in zip(coords, self.lo, self.hi)], dim=1)
         proj = 2.0 * math.pi * (x @ self.B)
         return torch.cat([torch.cos(proj), torch.sin(proj)], dim=1)   # (N, 2m)
@@ -73,8 +65,6 @@ class ScaledInputs(nn.Module):
         return torch.cat([2*(c-l)/(h-l) - 1 for c,l,h in zip(coords, self.lo, self.hi)], dim=1)
 
 
-FeatureMap2D = FeatureMap  # backward-compat alias
-
 
 # ---------------------------------------------------------------------------
 # Method 0a — Vanilla PINN (baseline, no gating)
@@ -82,15 +72,11 @@ FeatureMap2D = FeatureMap  # backward-compat alias
 
 class VanillaPINN(nn.Module):
     """
-    Single-network PINN. Wraps a plain nn.Sequential so it shares the same
-    (gates, expert_vals, u) interface as MoEModel.
-
-    Returns trivial gates (ones) so the rest of the training code is unchanged;
-    the load-balancing loss weight should be set to 0.0 in the config when
-    using this model.
+    Single-network PINN with the same (gates, expert_vals, u) interface as MoEModel.
+    Returns trivial gates (all ones); set load-balancing weight to 0 in the config.
     """
 
-    def __init__(self, feature_map: FeatureMap2D, network: nn.Module):
+    def __init__(self, feature_map: FeatureMap, network: nn.Module):
         super().__init__()
         self.feature_map = feature_map
         self.network = network
@@ -114,7 +100,7 @@ class MoEModel(nn.Module):
     Controlled by config key: use_moe=True
     """
 
-    def __init__(self, feature_map: FeatureMap2D, gating_net: nn.Module, experts: list):
+    def __init__(self, feature_map: FeatureMap, gating_net: nn.Module, experts: list):
         super().__init__()
         self.feature_map = feature_map
         self.gating_net  = gating_net
@@ -184,32 +170,8 @@ def pde_residual(model, x, y, t, domain_params, use_fd=True, h=1e-2, pde_fn=None
     return u, u_y, u_t, u_yy, u_x, u_xx, r, gates, expert_vals, ini_pred
 
 
-def _causal_pde_loss(r, t_batch, T, eps, n_bins):
-    """
-    Causal/temporal weighting of the PDE residual (Wang et al. 2022).
-
-    Bins collocation points by time and downweights later-time bins by
-    exp(-eps * cumulative residual of all earlier bins), so the loss only
-    rewards fitting later dynamics once earlier ones are already satisfied.
-    """
-    r2 = (r ** 2).reshape(-1)
-    t  = t_batch.reshape(-1)
-    bin_idx = torch.clamp((t / T * n_bins).long(), 0, n_bins - 1)
-
-    bin_means = torch.stack([
-        r2[bin_idx == b].mean() if (bin_idx == b).any()
-        else torch.zeros((), device=r.device, dtype=r.dtype)
-        for b in range(n_bins)
-    ])
-    with torch.no_grad():
-        cum_prior = torch.cumsum(bin_means, dim=0) - bin_means
-        weights   = torch.exp(-eps * cum_prior)
-    return torch.sum(weights * bin_means) / torch.sum(weights)
-
-
 def compute_losses(model, x_batch, y_batch, t_batch, domain_params, K,
-                   ic_fn=None, use_fd=True, pde_fn=None, bc_fn=None,
-                   causal_eps=0.0, n_causal_bins=10):
+                   ic_fn=None, use_fd=True, pde_fn=None, bc_fn=None):
     """
     Returns unweighted individual losses and gates.
 
@@ -217,9 +179,6 @@ def compute_losses(model, x_batch, y_batch, t_batch, domain_params, K,
     pde_fn : residual callable — from DOMAIN["pde_fn"].
     bc_fn  : optional boundary loss callable bc_fn(model, device, domain_params).
     K      : load-balancing scale (0 for vanilla).
-    causal_eps, n_causal_bins : optional causal weighting of the PDE loss
-                                (see _causal_pde_loss). causal_eps=0 (default)
-                                reproduces the plain mean-squared residual.
     """
     if ic_fn is None:
         ic_fn = lambda x, y: torch.sin(y)
@@ -228,10 +187,7 @@ def compute_losses(model, x_batch, y_batch, t_batch, domain_params, K,
         model, x_batch, y_batch, t_batch, domain_params, use_fd=use_fd, pde_fn=pde_fn,
     )
 
-    if causal_eps:
-        loss_pde = _causal_pde_loss(r, t_batch, domain_params["T"], causal_eps, n_causal_bins)
-    else:
-        loss_pde = torch.mean(r ** 2)
+    loss_pde = torch.mean(r ** 2)
     loss_ini  = torch.mean((ic_fn(x_batch, y_batch) - ini_pred) ** 2)
     gbar      = torch.mean(gates, dim=0)
     loss_load = K * torch.sum(gbar ** 2)
@@ -364,69 +320,9 @@ def adaptive_refine(model, xyt_old, X_lo, X_hi, Y_lo, Y_hi, T, domain_params,
 
 def train(model, all_params, domain_params, config, eval_fn=None):
     """
-    Train a PINN (vanilla or MoE) with any combination of the four methods.
-
-    Parameters
-    ----------
-    model : VanillaPINN | MoEModel | callable
-        Any callable with signature model(y, t) -> (gates, expert_vals, u).
-        Use VanillaPINN or MoEModel for standard setups.
-    all_params : list[nn.Parameter]
-        All trainable parameters (passed to optimizer).
-    domain_params : dict
-        Y, T   -- domain extents
-        c, v   -- advection speed and diffusion coefficient
-        N_f    -- number of collocation points
-        K      -- load-balancing scale factor (set to 0 for VanillaPINN)
-    config : dict
-        # Method toggles
-        use_moe             : bool        -- True -> MoEModel, False -> VanillaPINN
-        moe_gating          : str         -- "continuous" | "binary"  (only when use_moe=True)
-        use_softadapt       : bool        -- Method 1
-        use_adaptive_refine : bool        -- Method 2
-        use_lbfgs           : bool        -- Method 3
-
-        # Loss weights
-        base_weights        : dict        -- {"pde": w1, "ini": w2, "load": w3}
-                                             load weight is forced to 0 when use_moe=False
-
-        # SoftAdapt params
-        softadapt_beta      : float
-
-        # Causal weighting (optional, default off — see _causal_pde_loss)
-        causal_eps          : float
-        n_causal_bins       : int
-
-        # Adam params
-        adam_epochs         : int
-        adam_lr             : float
-        adam_step_size      : int
-        adam_gamma          : float
-
-        # Adaptive refinement params
-        refine_every        : int
-        n_candidates        : int
-        replace_fraction    : float
-        refine_gamma        : float
-
-        # Collocation resampling (optional, default off — 0 = reuse the
-        # initial draw for the whole run, as before; N = redraw all N_f
-        # points fresh every N epochs). Ignored whenever use_adaptive_refine
-        # is True for this config — AR manages the collocation set instead,
-        # since full resampling would wipe its targeted picks immediately.
-        resample_every      : int
-
-        # L-BFGS params
-        lbfgs_max_iter      : int
-
-        # Misc
-        log_every           : int
-        ic_fn               : callable    -- default torch.sin
-
-    Returns
-    -------
-    hist : dict
-        Per-epoch lists keyed by loss component name + "total".
+    Adam + optional L-BFGS training loop with SoftAdapt, adaptive refinement,
+    and periodic collocation resampling controlled by config toggles.
+    Returns hist dict with per-epoch loss history, wall times, and eval snapshots.
     """
     T     = domain_params["T"]
     X_lo  = domain_params.get("X_lo", 0.0)
@@ -446,14 +342,12 @@ def train(model, all_params, domain_params, config, eval_fn=None):
         base_weights["load"] = 0.0
         K = 0.0
 
-    # Add BC loss term if boundary conditions are defined
     if bc_fn is not None:
         base_weights["bc"] = domain_params.get("bc_weight", 10.0)
 
     loss_names = list(base_weights.keys())
     dev        = all_params[0].device
 
-    # Collocation points — sampled uniformly over each dimension's [lo, hi]
     x_f = X_lo + (X_hi - X_lo) * torch.rand(N_f, 1, device=dev)
     y_f = Y_lo + (Y_hi - Y_lo) * torch.rand(N_f, 1, device=dev)
     t_f = T    *                  torch.rand(N_f, 1, device=dev)
@@ -466,7 +360,6 @@ def train(model, all_params, domain_params, config, eval_fn=None):
         enabled      = config.get("use_softadapt", False),
     )
 
-    # Adam + LR scheduler
     optimizer = torch.optim.Adam(all_params, lr=config.get("adam_lr", 1e-3))
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
@@ -495,10 +388,7 @@ def train(model, all_params, domain_params, config, eval_fn=None):
     log_every      = config.get("log_every", 500)
     use_fd         = config.get("use_fd_deriv", True)
     use_ar         = config.get("use_adaptive_refine", False)
-    # Resampling and adaptive refinement both replace points in x_f/y_f/t_f;
-    # full resampling would immediately wipe AR's targeted picks, so when AR
-    # is on for this config, resampling is skipped and AR alone manages the
-    # collocation set.
+    # Skip resampling when AR is on — AR manages the collocation set.
     resample_every = config.get("resample_every", 0) if not use_ar else 0
 
     # ---- Adam phase --------------------------------------------------------
@@ -511,8 +401,6 @@ def train(model, all_params, domain_params, config, eval_fn=None):
         losses, _ = compute_losses(
             model, x_f, y_f, t_f, domain_params, K, ic_fn,
             use_fd=use_fd, pde_fn=pde_fn, bc_fn=bc_fn,
-            causal_eps=config.get("causal_eps", 0.0),
-            n_causal_bins=config.get("n_causal_bins", 10),
         )
         weights   = softadapt(losses)
 
@@ -577,8 +465,6 @@ def train(model, all_params, domain_params, config, eval_fn=None):
             losses_c, _ = compute_losses(
                 model, x_f, y_f, t_f, domain_params, K, ic_fn,
                 use_fd=use_fd, pde_fn=pde_fn, bc_fn=bc_fn,
-                causal_eps=config.get("causal_eps", 0.0),
-                n_causal_bins=config.get("n_causal_bins", 10),
             )
             weights_c   = softadapt(losses_c, update=False)
             loss_c      = sum(weights_c[name] * losses_c[name] for name in loss_names)
@@ -589,117 +475,11 @@ def train(model, all_params, domain_params, config, eval_fn=None):
         final_loss = lbfgs.step(closure)
         print(f"L-BFGS final loss = {final_loss.item():.6e}")
 
+        if eval_fn is not None and eval_every > 0:
+            metrics = eval_fn(model, adam_epochs)
+            hist["eval_epochs"].append(adam_epochs)
+            hist["eval_l2_rel"].append(metrics.get("l2_rel", float("nan")))
+            hist["eval_max_err"].append(metrics.get("max_err", float("nan")))
+            hist["wall_time"].append(time.time() - t_start)
+
     return hist
-
-
-# ---------------------------------------------------------------------------
-# Finite-difference reference solver
-# ---------------------------------------------------------------------------
-
-def numerical_solve(domain_params, N_y=512, N_t_plot=1000):
-    """
-    Explicit finite-difference solver for u_t + c*u_y = v*u_yy on periodic [0,Y].
-    IC: u(y,0) = sin(y).   Exact: u(y,t) = exp(-v*t)*sin(y - c*t).
-
-    Spatial discretisation:
-      - advection : first-order upwind  (backward diff for c > 0)
-      - diffusion : second-order central differences
-    Time integration: explicit Euler with dt chosen for stability:
-      dt = 0.4 * min( dy/|c|,  dy²/(2v) )
-
-    Parameters
-    ----------
-    domain_params : dict   Y, T, c, v
-    N_y           : int    spatial grid points
-    N_t_plot      : int    number of time snapshots to record error history at
-
-    Returns
-    -------
-    dict with keys:
-        u_final, u_exact_final, y_grid, t_grid,
-        l2_rel_history, max_err_history,
-        l2_rel_final, max_err_final,
-        solve_time_sec, N_y, N_t_plot
-    """
-    Y_lo = domain_params.get("Y_lo", 0.0)
-    Y_hi = domain_params["Y_hi"]
-    Y    = Y_hi - Y_lo                # spatial extent of the periodic 1-D domain
-    T    = domain_params["T"]
-    c    = domain_params.get("c", 1.0)   # advection speed along y (1-D solver only)
-    v    = domain_params.get("v", 1.0)   # diffusion coefficient along y
-
-    dy = Y / N_y
-    dt = 0.4 * min(
-        dy / abs(c)        if c != 0 else float("inf"),
-        dy**2 / (2.0 * v)  if v != 0 else float("inf"),
-    )
-    N_t = max(1, int(np.ceil(T / dt)))
-    dt  = T / N_t   # adjust so the last step lands exactly on T
-
-    r_adv  = c * dt / dy       # upwind advection coefficient
-    r_diff = v * dt / dy**2    # diffusion coefficient
-
-    ic_fn_np = domain_params.get("ic_fn_np", lambda x_, y_: np.sin(y_))
-    exact_fn = domain_params.get("exact_fn", None)
-
-    y = np.linspace(0.0, Y, N_y, endpoint=False)
-    u = ic_fn_np(np.zeros_like(y), y).copy()
-
-    def analytic(t_val):
-        if exact_fn is None:
-            return None
-        return exact_fn(np.zeros_like(y), y, t_val, domain_params)
-
-    def errors(u_num, t_val):
-        ex = analytic(t_val)
-        if ex is None:
-            return (float("nan"), float("nan"))
-        err = u_num - ex
-        return (float(np.linalg.norm(err) / np.linalg.norm(ex)),
-                float(np.max(np.abs(err))))
-
-    # Map each of the N_t_plot+1 output times to the nearest time step
-    t_out       = np.linspace(0.0, T, N_t_plot + 1)
-    record_step = np.clip(np.round(t_out / dt).astype(int), 0, N_t)
-
-    step_to_out = defaultdict(list)
-    for out_idx, step in enumerate(record_step):
-        step_to_out[int(step)].append(out_idx)
-
-    l2_history  = np.empty(N_t_plot + 1)
-    max_history = np.empty(N_t_plot + 1)
-
-    u_m = np.empty(N_y)  # u[j-1], pre-allocated
-    u_p = np.empty(N_y)  # u[j+1], pre-allocated
-
-    t_wall = time.time()
-
-    for step in range(N_t + 1):
-        if step in step_to_out:
-            t_val = step * dt
-            l2, mx = errors(u, t_val)
-            for out_idx in step_to_out[step]:
-                l2_history[out_idx]  = l2
-                max_history[out_idx] = mx
-
-        if step < N_t:
-            u_m[1:]  = u[:-1];  u_m[0]  = u[-1]   # periodic j-1
-            u_p[:-1] = u[1:];   u_p[-1] = u[0]    # periodic j+1
-            # upwind advection (c > 0: backward diff) + central diffusion
-            u = u - r_adv * (u - u_m) + r_diff * (u_p - 2.0 * u + u_m)
-
-    solve_time = time.time() - t_wall
-
-    return {
-        "u_final":          u.copy(),
-        "u_exact_final":    analytic(T),
-        "y_grid":           y,
-        "t_grid":           t_out,
-        "l2_rel_history":   l2_history,
-        "max_err_history":  max_history,
-        "l2_rel_final":     float(l2_history[-1]),
-        "max_err_final":    float(max_history[-1]),
-        "solve_time_sec":   solve_time,
-        "N_y":              N_y,
-        "N_t_plot":         N_t_plot,
-    }

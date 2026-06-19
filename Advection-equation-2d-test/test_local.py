@@ -1,30 +1,8 @@
 """
-Local test of the accuracy fixes from the boundary-condition investigation,
-applied on top of the best / median / worst configs from the main sweep
-ranking (results/, 34 configs x 5 seeds, ranked by rank_configs() in
-plot.py).
-
-These changes are scoped to this script only — configs.py / methods.py
-default behaviour for the production sweep (train.py) is unchanged:
-
-  - Dirichlet boundary loss using the closed-form exact_fn at the four
-    edges of the truncated box (DOMAIN["bc_fn"] is None for every CONFIGS
-    entry — this problem was treated as a pure Cauchy/IC-only problem with
-    no boundary constraint at all).
-  - Hard-constrained IC: u = ic_fn(x,y) + t * network(x,y,t), so the
-    initial condition is satisfied exactly instead of via a soft loss term
-    (zero added parameters — same network, reparametrized output).
-  - Causal/temporal weighting of the PDE residual (methods.py's
-    causal_eps/n_causal_bins, default 0.0/off everywhere else).
-  - Constant learning rate (adam_gamma=1.0) instead of the StepLR decay.
-  - Fresh collocation points every epoch (methods.py's resample_every,
-    default 0/off everywhere else) instead of reusing one fixed batch of
-    N_f points for the whole run, to avoid overfitting to that fixed set.
+Quick local test of best/median/worst configs with a reduced training budget.
 
 Usage:
-    python test_local.py
-
-Expected runtime on CPU laptop: ~3-6 minutes total (3 configs).
+    python test_local.py   (~3-6 min on CPU)
 """
 
 import os
@@ -32,7 +10,6 @@ import time
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from configs import CONFIGS, DOMAIN
 from train import build_model, evaluate, solution_grid
@@ -49,11 +26,6 @@ SELECTED = [("best", BEST_NAME), ("median", MEDIAN_NAME), ("worst", WORST_NAME)]
 
 SEED = 1234
 
-# If True, hard-constrains u(x,y,0) = ic_fn(x,y) exactly (HardICWrapper) so the
-# 'ini' loss is always ~0 and its weight has no effect. If False, the IC is
-# enforced the normal way, as a weighted loss term balanced against pde/bc.
-USE_HARD_IC = False
-
 # ---------------------------------------------------------------------------
 # Lightweight overrides + the fixes under test
 # ---------------------------------------------------------------------------
@@ -69,68 +41,6 @@ _TEST_OVERRIDES = {
     "lbfgs_max_iter": 50,
     "eval_every":     50,
     "log_every":      100,
-    "causal_eps":     1.0,    # enable causal/temporal weighting of the PDE loss
-    "n_causal_bins":  10,
-}
-
-
-def _dirichlet_bc_fn(model, device, domain):
-    """
-    Dirichlet boundary loss using the closed-form exact_fn (valid on all of
-    R^2 for this manufactured problem) at the four edges of the truncated
-    box. The production bc_fn in configs.py implements a Robin+Neumann
-    condition that doesn't match this IC/exact_fn and is disabled anyway
-    (DOMAIN["bc_fn"] = None) — this replaces it for the test only.
-    """
-    X_lo, X_hi = domain["X_lo"], domain["X_hi"]
-    Y_lo, Y_hi = domain["Y_lo"], domain["Y_hi"]
-    T          = domain["T"]
-    exact_fn   = domain["exact_fn"]
-    N = 200
-
-    def _edge_loss(x, y, t):
-        _, _, u_pred = model(x, y, t)
-        u_exact_np = exact_fn(x.detach().cpu().numpy(), y.detach().cpu().numpy(),
-                               t.detach().cpu().numpy(), domain)
-        u_exact = torch.as_tensor(u_exact_np, dtype=u_pred.dtype, device=u_pred.device)
-        return torch.mean((u_pred - u_exact) ** 2)
-
-    t = T * torch.rand(N, 1, device=device)
-    y = Y_lo + (Y_hi - Y_lo) * torch.rand(N, 1, device=device)
-    loss_left  = _edge_loss(torch.full((N, 1), X_lo, device=device), y, t)
-    loss_right = _edge_loss(torch.full((N, 1), X_hi, device=device), y, t)
-
-    t = T * torch.rand(N, 1, device=device)
-    x = X_lo + (X_hi - X_lo) * torch.rand(N, 1, device=device)
-    loss_bot = _edge_loss(x, torch.full((N, 1), Y_lo, device=device), t)
-    loss_top = _edge_loss(x, torch.full((N, 1), Y_hi, device=device), t)
-
-    return (loss_left + loss_right + loss_bot + loss_top) / 4.0
-
-
-class HardICWrapper(nn.Module):
-    """
-    Reparametrizes the network output as u = ic_fn(x,y) + t * network(x,y,t)
-    so the initial condition is satisfied exactly (zero added parameters)
-    instead of via a soft loss term.
-    """
-
-    def __init__(self, base_model, ic_fn):
-        super().__init__()
-        self.base_model = base_model
-        self.ic_fn = ic_fn
-
-    def forward(self, x, y, t):
-        gates, expert_vals, u_raw = self.base_model(x, y, t)
-        u = self.ic_fn(x, y) + t * u_raw
-        return gates, expert_vals, u
-
-
-_TEST_DOMAIN = {
-    **DOMAIN,
-    "N_f":       15000,
-    "bc_fn":     _dirichlet_bc_fn,
-    "bc_weight": 10.0,
 }
 
 
@@ -166,9 +76,7 @@ def main():
         torch.manual_seed(SEED)
         np.random.seed(SEED)
 
-        base_model = build_model(test_cfg, device)
-        model      = (HardICWrapper(base_model, DOMAIN["ic_fn"]).to(device)
-                      if USE_HARD_IC else base_model)
+        model      = build_model(test_cfg, device)
         all_params = list(model.parameters())
         n_params   = sum(p.numel() for p in all_params)
         print(f"  Parameters : {n_params:,}")
@@ -176,7 +84,7 @@ def main():
         eval_fn = lambda m, e: evaluate(m, device, n_grid=100)
 
         t0   = time.time()
-        hist = run_training(model, all_params, _TEST_DOMAIN, test_cfg, eval_fn=eval_fn)
+        hist = run_training(model, all_params, DOMAIN, test_cfg, eval_fn=eval_fn)
         elapsed = time.time() - t0
 
         final = evaluate(model, device, n_grid=100)

@@ -32,13 +32,11 @@ def compute_boundary_loss(model, conditions, loss_fn):
     neumann_n = conditions["neumann_n"]
     neumann_ø = conditions["neumann_ø"]
 
-    # Predictions
     u_v = model(venstre)
     u_h = model(højre)
     u_n = model(nedre)
     u_ø = model(øvre)
 
-    # Gradients
     grad_v = torch.autograd.grad(u_v, venstre, torch.ones_like(u_v), create_graph=True)[0]
     grad_h = torch.autograd.grad(u_h, højre, torch.ones_like(u_h), create_graph=True)[0]
     grad_n = torch.autograd.grad(u_n, nedre, torch.ones_like(u_n), create_graph=True)[0]

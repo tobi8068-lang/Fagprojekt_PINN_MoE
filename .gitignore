@@ -1,2 +1,18 @@
 __pycache__/
 *.pyc
+
+# Output directories
+results*/
+figures*/
+*.log
+
+# Archives and data
+*.zip
+*.npz
+
+# Papers / reports
+*.pdf
+
+# IDE / tool configs
+.vscode/
+.claude/
